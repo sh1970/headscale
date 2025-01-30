@@ -3,16 +3,17 @@ package hscontrol
 import (
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 
 	"github.com/gorilla/mux"
+	"github.com/juanfont/headscale/hscontrol/capver"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/rs/zerolog/log"
 	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
 	"tailscale.com/control/controlbase"
-	"tailscale.com/control/controlhttp"
+	"tailscale.com/control/controlhttp/controlhttpserver"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 )
@@ -72,7 +73,7 @@ func (h *Headscale) NoiseUpgradeHandler(
 		challenge: key.NewChallenge(),
 	}
 
-	noiseConn, err := controlhttp.AcceptHTTP(
+	noiseConn, err := controlhttpserver.AcceptHTTP(
 		req.Context(),
 		writer,
 		req,
@@ -80,9 +81,7 @@ func (h *Headscale) NoiseUpgradeHandler(
 		noiseServer.earlyNoise,
 	)
 	if err != nil {
-		log.Error().Err(err).Msg("noise upgrade failed")
-		http.Error(writer, err.Error(), http.StatusInternalServerError)
-
+		httpError(writer, err, "noise upgrade failed", http.StatusInternalServerError)
 		return
 	}
 
@@ -95,22 +94,17 @@ func (h *Headscale) NoiseUpgradeHandler(
 	// The HTTP2 server that exposes this router is created for
 	// a single hijacked connection from /ts2021, using netutil.NewOneConnListener
 	router := mux.NewRouter()
+	router.Use(prometheusMiddleware)
 
 	router.HandleFunc("/machine/register", noiseServer.NoiseRegistrationHandler).
 		Methods(http.MethodPost)
 	router.HandleFunc("/machine/map", noiseServer.NoisePollNetMapHandler)
 
-	server := http.Server{
-		ReadTimeout: types.HTTPReadTimeout,
-	}
-
 	noiseServer.httpBaseConfig = &http.Server{
 		Handler:           router,
-		ReadHeaderTimeout: types.HTTPReadTimeout,
+		ReadHeaderTimeout: types.HTTPTimeout,
 	}
 	noiseServer.http2Server = &http2.Server{}
-
-	server.Handler = h2c.NewHandler(router, noiseServer.http2Server)
 
 	noiseServer.http2Server.ServeConn(
 		noiseConn,
@@ -121,18 +115,8 @@ func (h *Headscale) NoiseUpgradeHandler(
 }
 
 func (ns *noiseServer) earlyNoise(protocolVersion int, writer io.Writer) error {
-	log.Trace().
-		Caller().
-		Int("protocol_version", protocolVersion).
-		Str("challenge", ns.challenge.Public().String()).
-		Msg("earlyNoise called")
-
-	if protocolVersion < earlyNoiseCapabilityVersion {
-		log.Trace().
-			Caller().
-			Msgf("protocol version %d does not support early noise", protocolVersion)
-
-		return nil
+	if !isSupportedVersion(tailcfg.CapabilityVersion(protocolVersion)) {
+		return fmt.Errorf("unsupported client version: %d", protocolVersion)
 	}
 
 	earlyJSON, err := json.Marshal(&tailcfg.EarlyNoise{
@@ -162,4 +146,108 @@ func (ns *noiseServer) earlyNoise(protocolVersion int, writer io.Writer) error {
 	}
 
 	return nil
+}
+
+const (
+	MinimumCapVersion tailcfg.CapabilityVersion = 82
+)
+
+func isSupportedVersion(version tailcfg.CapabilityVersion) bool {
+	return version >= MinimumCapVersion
+}
+
+func rejectUnsupported(writer http.ResponseWriter, version tailcfg.CapabilityVersion, mkey key.MachinePublic, nkey key.NodePublic) bool {
+	// Reject unsupported versions
+	if !isSupportedVersion(version) {
+		log.Error().
+			Caller().
+			Int("minimum_cap_ver", int(MinimumCapVersion)).
+			Int("client_cap_ver", int(version)).
+			Str("minimum_version", capver.TailscaleVersion(MinimumCapVersion)).
+			Str("client_version", capver.TailscaleVersion(version)).
+			Str("node_key", nkey.ShortString()).
+			Str("machine_key", mkey.ShortString()).
+			Msg("unsupported client connected")
+		http.Error(writer, "unsupported client version", http.StatusBadRequest)
+
+		return true
+	}
+
+	return false
+}
+
+// NoisePollNetMapHandler takes care of /machine/:id/map using the Noise protocol
+//
+// This is the busiest endpoint, as it keeps the HTTP long poll that updates
+// the clients when something in the network changes.
+//
+// The clients POST stuff like HostInfo and their Endpoints here, but
+// only after their first request (marked with the ReadOnly field).
+//
+// At this moment the updates are sent in a quite horrendous way, but they kinda work.
+func (ns *noiseServer) NoisePollNetMapHandler(
+	writer http.ResponseWriter,
+	req *http.Request,
+) {
+	body, _ := io.ReadAll(req.Body)
+
+	var mapRequest tailcfg.MapRequest
+	if err := json.Unmarshal(body, &mapRequest); err != nil {
+		httpError(writer, err, "Internal error", http.StatusInternalServerError)
+		return
+	}
+
+	// Reject unsupported versions
+	if rejectUnsupported(writer, mapRequest.Version, ns.machineKey, mapRequest.NodeKey) {
+		return
+	}
+
+	ns.nodeKey = mapRequest.NodeKey
+
+	node, err := ns.headscale.db.GetNodeByAnyKey(
+		ns.conn.Peer(),
+		mapRequest.NodeKey,
+		key.NodePublic{},
+	)
+	if err != nil {
+		httpError(writer, err, "Internal error", http.StatusInternalServerError)
+		return
+	}
+
+	sess := ns.headscale.newMapSession(req.Context(), mapRequest, writer, node)
+	sess.tracef("a node sending a MapRequest with Noise protocol")
+	if !sess.isStreaming() {
+		sess.serve()
+	} else {
+		sess.serveLongPoll()
+	}
+}
+
+// NoiseRegistrationHandler handles the actual registration process of a node.
+func (ns *noiseServer) NoiseRegistrationHandler(
+	writer http.ResponseWriter,
+	req *http.Request,
+) {
+	if req.Method != http.MethodPost {
+		httpError(writer, nil, "Wrong method", http.StatusMethodNotAllowed)
+
+		return
+	}
+
+	body, _ := io.ReadAll(req.Body)
+	var registerRequest tailcfg.RegisterRequest
+	if err := json.Unmarshal(body, &registerRequest); err != nil {
+		httpError(writer, err, "Internal error", http.StatusInternalServerError)
+
+		return
+	}
+
+	// Reject unsupported versions
+	if rejectUnsupported(writer, registerRequest.Version, ns.machineKey, registerRequest.NodeKey) {
+		return
+	}
+
+	ns.nodeKey = registerRequest.NodeKey
+
+	ns.headscale.handleRegister(writer, req, registerRequest, ns.conn.Peer())
 }

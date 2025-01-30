@@ -60,11 +60,9 @@ var listPreAuthKeys = &cobra.Command{
 		user, err := cmd.Flags().GetString("user")
 		if err != nil {
 			ErrorOutput(err, fmt.Sprintf("Error getting user: %s", err), output)
-
-			return
 		}
 
-		ctx, client, conn, cancel := getHeadscaleCLIClient()
+		ctx, client, conn, cancel := newHeadscaleCLIWithConfig()
 		defer cancel()
 		defer conn.Close()
 
@@ -85,8 +83,6 @@ var listPreAuthKeys = &cobra.Command{
 
 		if output != "" {
 			SuccessOutput(response.GetPreAuthKeys(), "", output)
-
-			return
 		}
 
 		tableData := pterm.TableData{
@@ -107,13 +103,6 @@ var listPreAuthKeys = &cobra.Command{
 				expiration = ColourTime(key.GetExpiration().AsTime())
 			}
 
-			var reusable string
-			if key.GetEphemeral() {
-				reusable = "N/A"
-			} else {
-				reusable = fmt.Sprintf("%v", key.GetReusable())
-			}
-
 			aclTags := ""
 
 			for _, tag := range key.GetAclTags() {
@@ -125,7 +114,7 @@ var listPreAuthKeys = &cobra.Command{
 			tableData = append(tableData, []string{
 				key.GetId(),
 				key.GetKey(),
-				reusable,
+				strconv.FormatBool(key.GetReusable()),
 				strconv.FormatBool(key.GetEphemeral()),
 				strconv.FormatBool(key.GetUsed()),
 				expiration,
@@ -141,8 +130,6 @@ var listPreAuthKeys = &cobra.Command{
 				fmt.Sprintf("Failed to render pterm table: %s", err),
 				output,
 			)
-
-			return
 		}
 	},
 }
@@ -157,19 +144,11 @@ var createPreAuthKeyCmd = &cobra.Command{
 		user, err := cmd.Flags().GetString("user")
 		if err != nil {
 			ErrorOutput(err, fmt.Sprintf("Error getting user: %s", err), output)
-
-			return
 		}
 
 		reusable, _ := cmd.Flags().GetBool("reusable")
 		ephemeral, _ := cmd.Flags().GetBool("ephemeral")
 		tags, _ := cmd.Flags().GetStringSlice("tags")
-
-		log.Trace().
-			Bool("reusable", reusable).
-			Bool("ephemeral", ephemeral).
-			Str("user", user).
-			Msg("Preparing to create preauthkey")
 
 		request := &v1.CreatePreAuthKeyRequest{
 			User:      user,
@@ -187,8 +166,6 @@ var createPreAuthKeyCmd = &cobra.Command{
 				fmt.Sprintf("Could not parse duration: %s\n", err),
 				output,
 			)
-
-			return
 		}
 
 		expiration := time.Now().UTC().Add(time.Duration(duration))
@@ -199,7 +176,7 @@ var createPreAuthKeyCmd = &cobra.Command{
 
 		request.Expiration = timestamppb.New(expiration)
 
-		ctx, client, conn, cancel := getHeadscaleCLIClient()
+		ctx, client, conn, cancel := newHeadscaleCLIWithConfig()
 		defer cancel()
 		defer conn.Close()
 
@@ -210,8 +187,6 @@ var createPreAuthKeyCmd = &cobra.Command{
 				fmt.Sprintf("Cannot create Pre Auth Key: %s\n", err),
 				output,
 			)
-
-			return
 		}
 
 		SuccessOutput(response.GetPreAuthKey(), response.GetPreAuthKey().GetKey(), output)
@@ -234,11 +209,9 @@ var expirePreAuthKeyCmd = &cobra.Command{
 		user, err := cmd.Flags().GetString("user")
 		if err != nil {
 			ErrorOutput(err, fmt.Sprintf("Error getting user: %s", err), output)
-
-			return
 		}
 
-		ctx, client, conn, cancel := getHeadscaleCLIClient()
+		ctx, client, conn, cancel := newHeadscaleCLIWithConfig()
 		defer cancel()
 		defer conn.Close()
 
@@ -254,8 +227,6 @@ var expirePreAuthKeyCmd = &cobra.Command{
 				fmt.Sprintf("Cannot expire Pre Auth Key: %s\n", err),
 				output,
 			)
-
-			return
 		}
 
 		SuccessOutput(response, "Key expired", output)

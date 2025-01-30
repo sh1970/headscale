@@ -44,7 +44,7 @@ var retry = func(times int, sleepInterval time.Duration,
 
 func sshScenario(t *testing.T, policy *policy.ACLPolicy, clientsPerUser int) *Scenario {
 	t.Helper()
-	scenario, err := NewScenario()
+	scenario, err := NewScenario(dockertestMaxWait())
 	assertNoErr(t, err)
 
 	spec := map[string]int{
@@ -69,9 +69,6 @@ func sshScenario(t *testing.T, policy *policy.ACLPolicy, clientsPerUser int) *Sc
 		},
 		hsic.WithACLPolicy(policy),
 		hsic.WithTestName("ssh"),
-		hsic.WithConfigEnv(map[string]string{
-			"HEADSCALE_EXPERIMENTAL_FEATURE_SSH": "1",
-		}),
 	)
 	assertNoErr(t, err)
 
@@ -111,7 +108,7 @@ func TestSSHOneUserToAll(t *testing.T) {
 		},
 		len(MustTestVersions),
 	)
-	defer scenario.Shutdown()
+	defer scenario.ShutdownAssertNoPanics(t)
 
 	allClients, err := scenario.ListTailscaleClients()
 	assertNoErrListClients(t, err)
@@ -176,7 +173,7 @@ func TestSSHMultipleUsersAllToAll(t *testing.T) {
 		},
 		len(MustTestVersions),
 	)
-	defer scenario.Shutdown()
+	defer scenario.ShutdownAssertNoPanics(t)
 
 	nsOneClients, err := scenario.ListTailscaleClients("user1")
 	assertNoErrListClients(t, err)
@@ -222,7 +219,7 @@ func TestSSHNoSSHConfigured(t *testing.T) {
 		},
 		len(MustTestVersions),
 	)
-	defer scenario.Shutdown()
+	defer scenario.ShutdownAssertNoPanics(t)
 
 	allClients, err := scenario.ListTailscaleClients()
 	assertNoErrListClients(t, err)
@@ -271,7 +268,7 @@ func TestSSHIsBlockedInACL(t *testing.T) {
 		},
 		len(MustTestVersions),
 	)
-	defer scenario.Shutdown()
+	defer scenario.ShutdownAssertNoPanics(t)
 
 	allClients, err := scenario.ListTailscaleClients()
 	assertNoErrListClients(t, err)
@@ -327,7 +324,7 @@ func TestSSHUserOnlyIsolation(t *testing.T) {
 		},
 		len(MustTestVersions),
 	)
-	defer scenario.Shutdown()
+	defer scenario.ShutdownAssertNoPanics(t)
 
 	ssh1Clients, err := scenario.ListTailscaleClients("user1")
 	assertNoErrListClients(t, err)

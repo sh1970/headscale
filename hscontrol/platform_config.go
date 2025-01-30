@@ -9,94 +9,17 @@ import (
 
 	"github.com/gofrs/uuid/v5"
 	"github.com/gorilla/mux"
-	"github.com/rs/zerolog/log"
+	"github.com/juanfont/headscale/hscontrol/templates"
 )
-
-//go:embed templates/apple.html
-var appleTemplate string
-
-//go:embed templates/windows.html
-var windowsTemplate string
 
 // WindowsConfigMessage shows a simple message in the browser for how to configure the Windows Tailscale client.
 func (h *Headscale) WindowsConfigMessage(
 	writer http.ResponseWriter,
 	req *http.Request,
 ) {
-	winTemplate := template.Must(template.New("windows").Parse(windowsTemplate))
-	config := map[string]interface{}{
-		"URL": h.cfg.ServerURL,
-	}
-
-	var payload bytes.Buffer
-	if err := winTemplate.Execute(&payload, config); err != nil {
-		log.Error().
-			Str("handler", "WindowsRegConfig").
-			Err(err).
-			Msg("Could not render Windows index template")
-
-		writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		writer.WriteHeader(http.StatusInternalServerError)
-		_, err := writer.Write([]byte("Could not render Windows index template"))
-		if err != nil {
-			log.Error().
-				Caller().
-				Err(err).
-				Msg("Failed to write response")
-		}
-
-		return
-	}
-
 	writer.Header().Set("Content-Type", "text/html; charset=utf-8")
 	writer.WriteHeader(http.StatusOK)
-	_, err := writer.Write(payload.Bytes())
-	if err != nil {
-		log.Error().
-			Caller().
-			Err(err).
-			Msg("Failed to write response")
-	}
-}
-
-// WindowsRegConfig generates and serves a .reg file configured with the Headscale server address.
-func (h *Headscale) WindowsRegConfig(
-	writer http.ResponseWriter,
-	req *http.Request,
-) {
-	config := WindowsRegistryConfig{
-		URL: h.cfg.ServerURL,
-	}
-
-	var content bytes.Buffer
-	if err := windowsRegTemplate.Execute(&content, config); err != nil {
-		log.Error().
-			Str("handler", "WindowsRegConfig").
-			Err(err).
-			Msg("Could not render Apple macOS template")
-
-		writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		writer.WriteHeader(http.StatusInternalServerError)
-		_, err := writer.Write([]byte("Could not render Windows registry template"))
-		if err != nil {
-			log.Error().
-				Caller().
-				Err(err).
-				Msg("Failed to write response")
-		}
-
-		return
-	}
-
-	writer.Header().Set("Content-Type", "text/x-ms-regedit; charset=utf-8")
-	writer.WriteHeader(http.StatusOK)
-	_, err := writer.Write(content.Bytes())
-	if err != nil {
-		log.Error().
-			Caller().
-			Err(err).
-			Msg("Failed to write response")
-	}
+	writer.Write([]byte(templates.Windows(h.cfg.ServerURL).Render()))
 }
 
 // AppleConfigMessage shows a simple message in the browser to point the user to the iOS/MacOS profile and instructions for how to install it.
@@ -104,41 +27,9 @@ func (h *Headscale) AppleConfigMessage(
 	writer http.ResponseWriter,
 	req *http.Request,
 ) {
-	appleTemplate := template.Must(template.New("apple").Parse(appleTemplate))
-
-	config := map[string]interface{}{
-		"URL": h.cfg.ServerURL,
-	}
-
-	var payload bytes.Buffer
-	if err := appleTemplate.Execute(&payload, config); err != nil {
-		log.Error().
-			Str("handler", "AppleMobileConfig").
-			Err(err).
-			Msg("Could not render Apple index template")
-
-		writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		writer.WriteHeader(http.StatusInternalServerError)
-		_, err := writer.Write([]byte("Could not render Apple index template"))
-		if err != nil {
-			log.Error().
-				Caller().
-				Err(err).
-				Msg("Failed to write response")
-		}
-
-		return
-	}
-
 	writer.Header().Set("Content-Type", "text/html; charset=utf-8")
 	writer.WriteHeader(http.StatusOK)
-	_, err := writer.Write(payload.Bytes())
-	if err != nil {
-		log.Error().
-			Caller().
-			Err(err).
-			Msg("Failed to write response")
-	}
+	writer.Write([]byte(templates.Apple(h.cfg.ServerURL).Render()))
 }
 
 func (h *Headscale) ApplePlatformConfig(
@@ -148,51 +39,19 @@ func (h *Headscale) ApplePlatformConfig(
 	vars := mux.Vars(req)
 	platform, ok := vars["platform"]
 	if !ok {
-		log.Error().
-			Str("handler", "ApplePlatformConfig").
-			Msg("No platform specified")
-		http.Error(writer, "No platform specified", http.StatusBadRequest)
-
+		httpError(writer, nil, "No platform specified", http.StatusBadRequest)
 		return
 	}
 
 	id, err := uuid.NewV4()
 	if err != nil {
-		log.Error().
-			Str("handler", "ApplePlatformConfig").
-			Err(err).
-			Msg("Failed not create UUID")
-
-		writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		writer.WriteHeader(http.StatusInternalServerError)
-		_, err := writer.Write([]byte("Failed to create UUID"))
-		if err != nil {
-			log.Error().
-				Caller().
-				Err(err).
-				Msg("Failed to write response")
-		}
-
+		httpError(writer, nil, "Failed to create UUID", http.StatusInternalServerError)
 		return
 	}
 
 	contentID, err := uuid.NewV4()
 	if err != nil {
-		log.Error().
-			Str("handler", "ApplePlatformConfig").
-			Err(err).
-			Msg("Failed not create UUID")
-
-		writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		writer.WriteHeader(http.StatusInternalServerError)
-		_, err := writer.Write([]byte("Failed to create content UUID"))
-		if err != nil {
-			log.Error().
-				Caller().
-				Err(err).
-				Msg("Failed to write response")
-		}
-
+		httpError(writer, nil, "Failed to create UUID", http.StatusInternalServerError)
 		return
 	}
 
@@ -202,68 +61,25 @@ func (h *Headscale) ApplePlatformConfig(
 	}
 
 	var payload bytes.Buffer
-	handleMacError := func(ierr error) {
-		log.Error().
-			Str("handler", "ApplePlatformConfig").
-			Err(ierr).
-			Msg("Could not render Apple macOS template")
-
-		writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		writer.WriteHeader(http.StatusInternalServerError)
-		_, err := writer.Write([]byte("Could not render Apple macOS template"))
-		if err != nil {
-			log.Error().
-				Caller().
-				Err(err).
-				Msg("Failed to write response")
-		}
-	}
 
 	switch platform {
 	case "macos-standalone":
 		if err := macosStandaloneTemplate.Execute(&payload, platformConfig); err != nil {
-			handleMacError(err)
-
+			httpError(writer, err, "Could not render Apple macOS template", http.StatusInternalServerError)
 			return
 		}
 	case "macos-app-store":
 		if err := macosAppStoreTemplate.Execute(&payload, platformConfig); err != nil {
-			handleMacError(err)
-
+			httpError(writer, err, "Could not render Apple macOS template", http.StatusInternalServerError)
 			return
 		}
 	case "ios":
 		if err := iosTemplate.Execute(&payload, platformConfig); err != nil {
-			log.Error().
-				Str("handler", "ApplePlatformConfig").
-				Err(err).
-				Msg("Could not render Apple iOS template")
-
-			writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
-			writer.WriteHeader(http.StatusInternalServerError)
-			_, err := writer.Write([]byte("Could not render Apple iOS template"))
-			if err != nil {
-				log.Error().
-					Caller().
-					Err(err).
-					Msg("Failed to write response")
-			}
-
+			httpError(writer, err, "Could not render Apple iOS template", http.StatusInternalServerError)
 			return
 		}
 	default:
-		writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		writer.WriteHeader(http.StatusBadRequest)
-		_, err := writer.Write(
-			[]byte("Invalid platform. Only ios, macos-app-store and macos-standalone are supported"),
-		)
-		if err != nil {
-			log.Error().
-				Caller().
-				Err(err).
-				Msg("Failed to write response")
-		}
-
+		httpError(writer, err, "Invalid platform. Only ios, macos-app-store and macos-standalone are supported", http.StatusInternalServerError)
 		return
 	}
 
@@ -275,38 +91,14 @@ func (h *Headscale) ApplePlatformConfig(
 
 	var content bytes.Buffer
 	if err := commonTemplate.Execute(&content, config); err != nil {
-		log.Error().
-			Str("handler", "ApplePlatformConfig").
-			Err(err).
-			Msg("Could not render Apple platform template")
-
-		writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		writer.WriteHeader(http.StatusInternalServerError)
-		_, err := writer.Write([]byte("Could not render Apple platform template"))
-		if err != nil {
-			log.Error().
-				Caller().
-				Err(err).
-				Msg("Failed to write response")
-		}
-
+		httpError(writer, err, "Could not render platform iOS template", http.StatusInternalServerError)
 		return
 	}
 
 	writer.Header().
 		Set("Content-Type", "application/x-apple-aspen-config; charset=utf-8")
 	writer.WriteHeader(http.StatusOK)
-	_, err = writer.Write(content.Bytes())
-	if err != nil {
-		log.Error().
-			Caller().
-			Err(err).
-			Msg("Failed to write response")
-	}
-}
-
-type WindowsRegistryConfig struct {
-	URL string
+	writer.Write(content.Bytes())
 }
 
 type AppleMobileConfig struct {
@@ -319,14 +111,6 @@ type AppleMobilePlatformConfig struct {
 	UUID uuid.UUID
 	URL  string
 }
-
-var windowsRegTemplate = textTemplate.Must(
-	textTemplate.New("windowsconfig").Parse(`Windows Registry Editor Version 5.00
-
-[HKEY_LOCAL_MACHINE\SOFTWARE\Tailscale IPN]
-"UnattendedMode"="always"
-"LoginURL"="{{.URL}}"
-`))
 
 var commonTemplate = textTemplate.Must(
 	textTemplate.New("mobileconfig").Parse(`<?xml version="1.0" encoding="UTF-8"?>

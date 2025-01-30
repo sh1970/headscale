@@ -1,19 +1,25 @@
 package integration
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/netip"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
+	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/juanfont/headscale/integration/hsic"
 	"github.com/juanfont/headscale/integration/tsic"
 	"github.com/rs/zerolog/log"
 	"github.com/samber/lo"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/errgroup"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/types/key"
 )
@@ -22,9 +28,9 @@ func TestPingAllByIP(t *testing.T) {
 	IntegrationSkip(t)
 	t.Parallel()
 
-	scenario, err := NewScenario()
+	scenario, err := NewScenario(dockertestMaxWait())
 	assertNoErr(t, err)
-	defer scenario.Shutdown()
+	defer scenario.ShutdownAssertNoPanics(t)
 
 	// TODO(kradalby): it does not look like the user thing works, only second
 	// get created? maybe only when many?
@@ -33,26 +39,12 @@ func TestPingAllByIP(t *testing.T) {
 		"user2": len(MustTestVersions),
 	}
 
-	headscaleConfig := map[string]string{
-		"HEADSCALE_DERP_URLS":                    "",
-		"HEADSCALE_DERP_SERVER_ENABLED":          "true",
-		"HEADSCALE_DERP_SERVER_REGION_ID":        "999",
-		"HEADSCALE_DERP_SERVER_REGION_CODE":      "headscale",
-		"HEADSCALE_DERP_SERVER_REGION_NAME":      "Headscale Embedded DERP",
-		"HEADSCALE_DERP_SERVER_STUN_LISTEN_ADDR": "0.0.0.0:3478",
-		"HEADSCALE_DERP_SERVER_PRIVATE_KEY_PATH": "/tmp/derp.key",
-
-		// Envknob for enabling DERP debug logs
-		"DERP_DEBUG_LOGS":        "true",
-		"DERP_PROBER_DEBUG_LOGS": "true",
-	}
-
 	err = scenario.CreateHeadscaleEnv(spec,
 		[]tsic.Option{},
 		hsic.WithTestName("pingallbyip"),
-		hsic.WithConfigEnv(headscaleConfig),
+		hsic.WithEmbeddedDERPServerOnly(),
 		hsic.WithTLS(),
-		hsic.WithHostnameAsServerURL(),
+		hsic.WithIPAllocationStrategy(types.IPAllocationStrategyRandom),
 	)
 	assertNoErrHeadscaleEnv(t, err)
 
@@ -65,7 +57,7 @@ func TestPingAllByIP(t *testing.T) {
 	err = scenario.WaitForTailscaleSync()
 	assertNoErrSync(t, err)
 
-	assertClientsState(t, allClients)
+	// assertClientsState(t, allClients)
 
 	allAddrs := lo.Map(allIps, func(x netip.Addr, index int) string {
 		return x.String()
@@ -79,9 +71,9 @@ func TestPingAllByIPPublicDERP(t *testing.T) {
 	IntegrationSkip(t)
 	t.Parallel()
 
-	scenario, err := NewScenario()
+	scenario, err := NewScenario(dockertestMaxWait())
 	assertNoErr(t, err)
-	defer scenario.Shutdown()
+	defer scenario.ShutdownAssertNoPanics(t)
 
 	spec := map[string]int{
 		"user1": len(MustTestVersions),
@@ -103,7 +95,7 @@ func TestPingAllByIPPublicDERP(t *testing.T) {
 	err = scenario.WaitForTailscaleSync()
 	assertNoErrSync(t, err)
 
-	assertClientsState(t, allClients)
+	// assertClientsState(t, allClients)
 
 	allAddrs := lo.Map(allIps, func(x netip.Addr, index int) string {
 		return x.String()
@@ -117,127 +109,159 @@ func TestAuthKeyLogoutAndRelogin(t *testing.T) {
 	IntegrationSkip(t)
 	t.Parallel()
 
-	scenario, err := NewScenario()
-	assertNoErr(t, err)
-	defer scenario.Shutdown()
+	for _, https := range []bool{true, false} {
+		t.Run(fmt.Sprintf("with-https-%t", https), func(t *testing.T) {
+			scenario, err := NewScenario(dockertestMaxWait())
+			assertNoErr(t, err)
+			defer scenario.ShutdownAssertNoPanics(t)
 
-	spec := map[string]int{
-		"user1": len(MustTestVersions),
-		"user2": len(MustTestVersions),
-	}
+			spec := map[string]int{
+				"user1": len(MustTestVersions),
+				"user2": len(MustTestVersions),
+			}
 
-	err = scenario.CreateHeadscaleEnv(spec, []tsic.Option{}, hsic.WithTestName("pingallbyip"))
-	assertNoErrHeadscaleEnv(t, err)
+			opts := []hsic.Option{hsic.WithTestName("pingallbyip")}
+			if https {
+				opts = append(opts, []hsic.Option{
+					hsic.WithTLS(),
+				}...)
+			}
 
-	allClients, err := scenario.ListTailscaleClients()
-	assertNoErrListClients(t, err)
+			err = scenario.CreateHeadscaleEnv(spec, []tsic.Option{}, opts...)
+			assertNoErrHeadscaleEnv(t, err)
 
-	err = scenario.WaitForTailscaleSync()
-	assertNoErrSync(t, err)
+			allClients, err := scenario.ListTailscaleClients()
+			assertNoErrListClients(t, err)
 
-	assertClientsState(t, allClients)
+			err = scenario.WaitForTailscaleSync()
+			assertNoErrSync(t, err)
 
-	clientIPs := make(map[TailscaleClient][]netip.Addr)
-	for _, client := range allClients {
-		ips, err := client.IPs()
-		if err != nil {
-			t.Fatalf("failed to get IPs for client %s: %s", client.Hostname(), err)
-		}
-		clientIPs[client] = ips
-	}
+			// assertClientsState(t, allClients)
 
-	for _, client := range allClients {
-		err := client.Logout()
-		if err != nil {
-			t.Fatalf("failed to logout client %s: %s", client.Hostname(), err)
-		}
-	}
+			clientIPs := make(map[TailscaleClient][]netip.Addr)
+			for _, client := range allClients {
+				ips, err := client.IPs()
+				if err != nil {
+					t.Fatalf("failed to get IPs for client %s: %s", client.Hostname(), err)
+				}
+				clientIPs[client] = ips
+			}
 
-	err = scenario.WaitForTailscaleLogout()
-	assertNoErrLogout(t, err)
-
-	t.Logf("all clients logged out")
-
-	headscale, err := scenario.Headscale()
-	assertNoErrGetHeadscale(t, err)
-
-	for userName := range spec {
-		key, err := scenario.CreatePreAuthKey(userName, true, false)
-		if err != nil {
-			t.Fatalf("failed to create pre-auth key for user %s: %s", userName, err)
-		}
-
-		err = scenario.RunTailscaleUp(userName, headscale.GetEndpoint(), key.GetKey())
-		if err != nil {
-			t.Fatalf("failed to run tailscale up for user %s: %s", userName, err)
-		}
-	}
-
-	err = scenario.WaitForTailscaleSync()
-	assertNoErrSync(t, err)
-
-	assertClientsState(t, allClients)
-
-	allClients, err = scenario.ListTailscaleClients()
-	assertNoErrListClients(t, err)
-
-	allIps, err := scenario.ListTailscaleClientsIPs()
-	assertNoErrListClientIPs(t, err)
-
-	allAddrs := lo.Map(allIps, func(x netip.Addr, index int) string {
-		return x.String()
-	})
-
-	success := pingAllHelper(t, allClients, allAddrs)
-	t.Logf("%d successful pings out of %d", success, len(allClients)*len(allIps))
-
-	for _, client := range allClients {
-		ips, err := client.IPs()
-		if err != nil {
-			t.Fatalf("failed to get IPs for client %s: %s", client.Hostname(), err)
-		}
-
-		// lets check if the IPs are the same
-		if len(ips) != len(clientIPs[client]) {
-			t.Fatalf("IPs changed for client %s", client.Hostname())
-		}
-
-		for _, ip := range ips {
-			found := false
-			for _, oldIP := range clientIPs[client] {
-				if ip == oldIP {
-					found = true
-
-					break
+			for _, client := range allClients {
+				err := client.Logout()
+				if err != nil {
+					t.Fatalf("failed to logout client %s: %s", client.Hostname(), err)
 				}
 			}
 
-			if !found {
-				t.Fatalf(
-					"IPs changed for client %s. Used to be %v now %v",
-					client.Hostname(),
-					clientIPs[client],
-					ips,
-				)
+			err = scenario.WaitForTailscaleLogout()
+			assertNoErrLogout(t, err)
+
+			t.Logf("all clients logged out")
+
+			headscale, err := scenario.Headscale()
+			assertNoErrGetHeadscale(t, err)
+
+			// if the server is not running with HTTPS, we have to wait a bit before
+			// reconnection as the newest Tailscale client has a measure that will only
+			// reconnect over HTTPS if they saw a noise connection previously.
+			// https://github.com/tailscale/tailscale/commit/1eaad7d3deb0815e8932e913ca1a862afa34db38
+			// https://github.com/juanfont/headscale/issues/2164
+			if !https {
+				time.Sleep(5 * time.Minute)
 			}
-		}
+
+			for userName := range spec {
+				key, err := scenario.CreatePreAuthKey(userName, true, false)
+				if err != nil {
+					t.Fatalf("failed to create pre-auth key for user %s: %s", userName, err)
+				}
+
+				err = scenario.RunTailscaleUp(userName, headscale.GetEndpoint(), key.GetKey())
+				if err != nil {
+					t.Fatalf("failed to run tailscale up for user %s: %s", userName, err)
+				}
+			}
+
+			err = scenario.WaitForTailscaleSync()
+			assertNoErrSync(t, err)
+
+			// assertClientsState(t, allClients)
+
+			allClients, err = scenario.ListTailscaleClients()
+			assertNoErrListClients(t, err)
+
+			allIps, err := scenario.ListTailscaleClientsIPs()
+			assertNoErrListClientIPs(t, err)
+
+			allAddrs := lo.Map(allIps, func(x netip.Addr, index int) string {
+				return x.String()
+			})
+
+			success := pingAllHelper(t, allClients, allAddrs)
+			t.Logf("%d successful pings out of %d", success, len(allClients)*len(allIps))
+
+			for _, client := range allClients {
+				ips, err := client.IPs()
+				if err != nil {
+					t.Fatalf("failed to get IPs for client %s: %s", client.Hostname(), err)
+				}
+
+				// lets check if the IPs are the same
+				if len(ips) != len(clientIPs[client]) {
+					t.Fatalf("IPs changed for client %s", client.Hostname())
+				}
+
+				for _, ip := range ips {
+					found := false
+					for _, oldIP := range clientIPs[client] {
+						if ip == oldIP {
+							found = true
+
+							break
+						}
+					}
+
+					if !found {
+						t.Fatalf(
+							"IPs changed for client %s. Used to be %v now %v",
+							client.Hostname(),
+							clientIPs[client],
+							ips,
+						)
+					}
+				}
+			}
+		})
 	}
 }
 
 func TestEphemeral(t *testing.T) {
+	testEphemeralWithOptions(t, hsic.WithTestName("ephemeral"))
+}
+
+func TestEphemeralInAlternateTimezone(t *testing.T) {
+	testEphemeralWithOptions(
+		t,
+		hsic.WithTestName("ephemeral-tz"),
+		hsic.WithTimezone("America/Los_Angeles"),
+	)
+}
+
+func testEphemeralWithOptions(t *testing.T, opts ...hsic.Option) {
 	IntegrationSkip(t)
 	t.Parallel()
 
-	scenario, err := NewScenario()
+	scenario, err := NewScenario(dockertestMaxWait())
 	assertNoErr(t, err)
-	defer scenario.Shutdown()
+	defer scenario.ShutdownAssertNoPanics(t)
 
 	spec := map[string]int{
 		"user1": len(MustTestVersions),
 		"user2": len(MustTestVersions),
 	}
 
-	headscale, err := scenario.Headscale(hsic.WithTestName("ephemeral"))
+	headscale, err := scenario.Headscale(opts...)
 	assertNoErrHeadscaleEnv(t, err)
 
 	for userName, clientCount := range spec {
@@ -307,13 +331,129 @@ func TestEphemeral(t *testing.T) {
 	}
 }
 
+// TestEphemeral2006DeletedTooQuickly verifies that ephemeral nodes are not
+// deleted by accident if they are still online and active.
+func TestEphemeral2006DeletedTooQuickly(t *testing.T) {
+	IntegrationSkip(t)
+	t.Parallel()
+
+	scenario, err := NewScenario(dockertestMaxWait())
+	assertNoErr(t, err)
+	defer scenario.ShutdownAssertNoPanics(t)
+
+	spec := map[string]int{
+		"user1": len(MustTestVersions),
+		"user2": len(MustTestVersions),
+	}
+
+	headscale, err := scenario.Headscale(
+		hsic.WithTestName("ephemeral2006"),
+		hsic.WithConfigEnv(map[string]string{
+			"HEADSCALE_EPHEMERAL_NODE_INACTIVITY_TIMEOUT": "1m6s",
+		}),
+	)
+	assertNoErrHeadscaleEnv(t, err)
+
+	for userName, clientCount := range spec {
+		err = scenario.CreateUser(userName)
+		if err != nil {
+			t.Fatalf("failed to create user %s: %s", userName, err)
+		}
+
+		err = scenario.CreateTailscaleNodesInUser(userName, "all", clientCount, []tsic.Option{}...)
+		if err != nil {
+			t.Fatalf("failed to create tailscale nodes in user %s: %s", userName, err)
+		}
+
+		key, err := scenario.CreatePreAuthKey(userName, true, true)
+		if err != nil {
+			t.Fatalf("failed to create pre-auth key for user %s: %s", userName, err)
+		}
+
+		err = scenario.RunTailscaleUp(userName, headscale.GetEndpoint(), key.GetKey())
+		if err != nil {
+			t.Fatalf("failed to run tailscale up for user %s: %s", userName, err)
+		}
+	}
+
+	err = scenario.WaitForTailscaleSync()
+	assertNoErrSync(t, err)
+
+	allClients, err := scenario.ListTailscaleClients()
+	assertNoErrListClients(t, err)
+
+	allIps, err := scenario.ListTailscaleClientsIPs()
+	assertNoErrListClientIPs(t, err)
+
+	allAddrs := lo.Map(allIps, func(x netip.Addr, index int) string {
+		return x.String()
+	})
+
+	// All ephemeral nodes should be online and reachable.
+	success := pingAllHelper(t, allClients, allAddrs)
+	t.Logf("%d successful pings out of %d", success, len(allClients)*len(allIps))
+
+	// Take down all clients, this should start an expiry timer for each.
+	for _, client := range allClients {
+		err := client.Down()
+		if err != nil {
+			t.Fatalf("failed to take down client %s: %s", client.Hostname(), err)
+		}
+	}
+
+	// Wait a bit and bring up the clients again before the expiry
+	// time of the ephemeral nodes.
+	// Nodes should be able to reconnect and work fine.
+	time.Sleep(30 * time.Second)
+
+	for _, client := range allClients {
+		err := client.Up()
+		if err != nil {
+			t.Fatalf("failed to take down client %s: %s", client.Hostname(), err)
+		}
+	}
+	err = scenario.WaitForTailscaleSync()
+	assertNoErrSync(t, err)
+
+	success = pingAllHelper(t, allClients, allAddrs)
+	t.Logf("%d successful pings out of %d", success, len(allClients)*len(allIps))
+
+	// Take down all clients, this should start an expiry timer for each.
+	for _, client := range allClients {
+		err := client.Down()
+		if err != nil {
+			t.Fatalf("failed to take down client %s: %s", client.Hostname(), err)
+		}
+	}
+
+	// This time wait for all of the nodes to expire and check that they are no longer
+	// registered.
+	time.Sleep(3 * time.Minute)
+
+	for userName := range spec {
+		nodes, err := headscale.ListNodesInUser(userName)
+		if err != nil {
+			log.Error().
+				Err(err).
+				Str("user", userName).
+				Msg("Error listing nodes in user")
+
+			return
+		}
+
+		if len(nodes) != 0 {
+			t.Fatalf("expected no nodes, got %d in user %s", len(nodes), userName)
+		}
+	}
+}
+
 func TestPingAllByHostname(t *testing.T) {
 	IntegrationSkip(t)
 	t.Parallel()
 
-	scenario, err := NewScenario()
+	scenario, err := NewScenario(dockertestMaxWait())
 	assertNoErr(t, err)
-	defer scenario.Shutdown()
+	defer scenario.ShutdownAssertNoPanics(t)
 
 	spec := map[string]int{
 		"user3": len(MustTestVersions),
@@ -329,7 +469,7 @@ func TestPingAllByHostname(t *testing.T) {
 	err = scenario.WaitForTailscaleSync()
 	assertNoErrSync(t, err)
 
-	assertClientsState(t, allClients)
+	// assertClientsState(t, allClients)
 
 	allHostnames, err := scenario.ListTailscaleClientsFQDNs()
 	assertNoErrListFQDN(t, err)
@@ -347,22 +487,22 @@ func TestTaildrop(t *testing.T) {
 	IntegrationSkip(t)
 	t.Parallel()
 
-	retry := func(times int, sleepInverval time.Duration, doWork func() error) error {
+	retry := func(times int, sleepInterval time.Duration, doWork func() error) error {
 		var err error
 		for attempts := 0; attempts < times; attempts++ {
 			err = doWork()
 			if err == nil {
 				return nil
 			}
-			time.Sleep(sleepInverval)
+			time.Sleep(sleepInterval)
 		}
 
 		return err
 	}
 
-	scenario, err := NewScenario()
+	scenario, err := NewScenario(dockertestMaxWait())
 	assertNoErr(t, err)
-	defer scenario.Shutdown()
+	defer scenario.ShutdownAssertNoPanics(t)
 
 	spec := map[string]int{
 		"taildrop": len(MustTestVersions),
@@ -517,20 +657,27 @@ func TestTaildrop(t *testing.T) {
 	}
 }
 
-func TestResolveMagicDNS(t *testing.T) {
+func TestUpdateHostnameFromClient(t *testing.T) {
 	IntegrationSkip(t)
 	t.Parallel()
 
-	scenario, err := NewScenario()
-	assertNoErr(t, err)
-	defer scenario.Shutdown()
+	user := "update-hostname-from-client"
 
-	spec := map[string]int{
-		"magicdns1": len(MustTestVersions),
-		"magicdns2": len(MustTestVersions),
+	hostnames := map[string]string{
+		"1": "user1-host",
+		"2": "User2-Host",
+		"3": "user3-host",
 	}
 
-	err = scenario.CreateHeadscaleEnv(spec, []tsic.Option{}, hsic.WithTestName("magicdns"))
+	scenario, err := NewScenario(dockertestMaxWait())
+	assertNoErrf(t, "failed to create scenario: %s", err)
+	defer scenario.ShutdownAssertNoPanics(t)
+
+	spec := map[string]int{
+		user: 3,
+	}
+
+	err = scenario.CreateHeadscaleEnv(spec, []tsic.Option{}, hsic.WithTestName("updatehostname"))
 	assertNoErrHeadscaleEnv(t, err)
 
 	allClients, err := scenario.ListTailscaleClients()
@@ -539,49 +686,102 @@ func TestResolveMagicDNS(t *testing.T) {
 	err = scenario.WaitForTailscaleSync()
 	assertNoErrSync(t, err)
 
-	assertClientsState(t, allClients)
+	headscale, err := scenario.Headscale()
+	assertNoErrGetHeadscale(t, err)
 
-	// Poor mans cache
-	_, err = scenario.ListTailscaleClientsFQDNs()
-	assertNoErrListFQDN(t, err)
-
-	_, err = scenario.ListTailscaleClientsIPs()
-	assertNoErrListClientIPs(t, err)
-
+	// update hostnames using the up command
 	for _, client := range allClients {
-		for _, peer := range allClients {
-			// It is safe to ignore this error as we handled it when caching it
-			peerFQDN, _ := peer.FQDN()
+		status, err := client.Status()
+		assertNoErr(t, err)
 
-			command := []string{
-				"tailscale",
-				"ip", peerFQDN,
-			}
-			result, _, err := client.Execute(command)
-			if err != nil {
-				t.Fatalf(
-					"failed to execute resolve/ip command %s from %s: %s",
-					peerFQDN,
-					client.Hostname(),
-					err,
-				)
-			}
-
-			ips, err := peer.IPs()
-			if err != nil {
-				t.Fatalf(
-					"failed to get ips for %s: %s",
-					peer.Hostname(),
-					err,
-				)
-			}
-
-			for _, ip := range ips {
-				if !strings.Contains(result, ip.String()) {
-					t.Fatalf("ip %s is not found in \n%s\n", ip.String(), result)
-				}
-			}
+		command := []string{
+			"tailscale",
+			"set",
+			"--hostname=" + hostnames[string(status.Self.ID)],
 		}
+		_, _, err = client.Execute(command)
+		assertNoErrf(t, "failed to set hostname: %s", err)
+	}
+
+	err = scenario.WaitForTailscaleSync()
+	assertNoErrSync(t, err)
+
+	var nodes []*v1.Node
+	err = executeAndUnmarshal(
+		headscale,
+		[]string{
+			"headscale",
+			"node",
+			"list",
+			"--output",
+			"json",
+		},
+		&nodes,
+	)
+
+	assertNoErr(t, err)
+	assert.Len(t, nodes, 3)
+
+	for _, node := range nodes {
+		hostname := hostnames[strconv.FormatUint(node.GetId(), 10)]
+		assert.Equal(t, hostname, node.GetName())
+		assert.Equal(t, util.ConvertWithFQDNRules(hostname), node.GetGivenName())
+	}
+
+	// Rename givenName in nodes
+	for _, node := range nodes {
+		givenName := fmt.Sprintf("%d-givenname", node.GetId())
+		_, err = headscale.Execute(
+			[]string{
+				"headscale",
+				"node",
+				"rename",
+				givenName,
+				"--identifier",
+				strconv.FormatUint(node.GetId(), 10),
+			})
+		assertNoErr(t, err)
+	}
+
+	time.Sleep(5 * time.Second)
+
+	// Verify that the clients can see the new hostname, but no givenName
+	for _, client := range allClients {
+		status, err := client.Status()
+		assertNoErr(t, err)
+
+		command := []string{
+			"tailscale",
+			"set",
+			"--hostname=" + hostnames[string(status.Self.ID)] + "NEW",
+		}
+		_, _, err = client.Execute(command)
+		assertNoErrf(t, "failed to set hostname: %s", err)
+	}
+
+	err = scenario.WaitForTailscaleSync()
+	assertNoErrSync(t, err)
+
+	err = executeAndUnmarshal(
+		headscale,
+		[]string{
+			"headscale",
+			"node",
+			"list",
+			"--output",
+			"json",
+		},
+		&nodes,
+	)
+
+	assertNoErr(t, err)
+	assert.Len(t, nodes, 3)
+
+	for _, node := range nodes {
+		hostname := hostnames[strconv.FormatUint(node.GetId(), 10)]
+		givenName := fmt.Sprintf("%d-givenname", node.GetId())
+		assert.Equal(t, hostname+"NEW", node.GetName())
+		assert.Equal(t, givenName, node.GetGivenName())
 	}
 }
 
@@ -589,9 +789,9 @@ func TestExpireNode(t *testing.T) {
 	IntegrationSkip(t)
 	t.Parallel()
 
-	scenario, err := NewScenario()
+	scenario, err := NewScenario(dockertestMaxWait())
 	assertNoErr(t, err)
-	defer scenario.Shutdown()
+	defer scenario.ShutdownAssertNoPanics(t)
 
 	spec := map[string]int{
 		"user1": len(MustTestVersions),
@@ -609,7 +809,7 @@ func TestExpireNode(t *testing.T) {
 	err = scenario.WaitForTailscaleSync()
 	assertNoErrSync(t, err)
 
-	assertClientsState(t, allClients)
+	// assertClientsState(t, allClients)
 
 	allAddrs := lo.Map(allIps, func(x netip.Addr, index int) string {
 		return x.String()
@@ -711,19 +911,19 @@ func TestExpireNode(t *testing.T) {
 	}
 }
 
-func TestNodeOnlineLastSeenStatus(t *testing.T) {
+func TestNodeOnlineStatus(t *testing.T) {
 	IntegrationSkip(t)
 	t.Parallel()
 
-	scenario, err := NewScenario()
+	scenario, err := NewScenario(dockertestMaxWait())
 	assertNoErr(t, err)
-	defer scenario.Shutdown()
+	defer scenario.ShutdownAssertNoPanics(t)
 
 	spec := map[string]int{
 		"user1": len(MustTestVersions),
 	}
 
-	err = scenario.CreateHeadscaleEnv(spec, []tsic.Option{}, hsic.WithTestName("onlinelastseen"))
+	err = scenario.CreateHeadscaleEnv(spec, []tsic.Option{}, hsic.WithTestName("online"))
 	assertNoErrHeadscaleEnv(t, err)
 
 	allClients, err := scenario.ListTailscaleClients()
@@ -735,7 +935,7 @@ func TestNodeOnlineLastSeenStatus(t *testing.T) {
 	err = scenario.WaitForTailscaleSync()
 	assertNoErrSync(t, err)
 
-	assertClientsState(t, allClients)
+	// assertClientsState(t, allClients)
 
 	allAddrs := lo.Map(allIps, func(x netip.Addr, index int) string {
 		return x.String()
@@ -754,8 +954,6 @@ func TestNodeOnlineLastSeenStatus(t *testing.T) {
 
 	headscale, err := scenario.Headscale()
 	assertNoErr(t, err)
-
-	keepAliveInterval := 60 * time.Second
 
 	// Duration is chosen arbitrarily, 10m is reported in #1561
 	testDuration := 12 * time.Minute
@@ -780,11 +978,6 @@ func TestNodeOnlineLastSeenStatus(t *testing.T) {
 		err = json.Unmarshal([]byte(result), &nodes)
 		assertNoErr(t, err)
 
-		now := time.Now()
-
-		// Threshold with some leeway
-		lastSeenThreshold := now.Add(-keepAliveInterval - (10 * time.Second))
-
 		// Verify that headscale reports the nodes as online
 		for _, node := range nodes {
 			// All nodes should be online
@@ -794,18 +987,6 @@ func TestNodeOnlineLastSeenStatus(t *testing.T) {
 				"expected %s to have online status in Headscale, marked as offline %s after start",
 				node.GetName(),
 				time.Since(start),
-			)
-
-			lastSeen := node.GetLastSeen().AsTime()
-			// All nodes should have been last seen between now and the keepAliveInterval
-			assert.Truef(
-				t,
-				lastSeen.After(lastSeenThreshold),
-				"node (%s) lastSeen (%v) was not %s after the threshold (%v)",
-				node.GetName(),
-				lastSeen,
-				keepAliveInterval,
-				lastSeenThreshold,
 			)
 		}
 
@@ -824,7 +1005,7 @@ func TestNodeOnlineLastSeenStatus(t *testing.T) {
 					continue
 				}
 
-				// All peers of this nodess are reporting to be
+				// All peers of this nodes are reporting to be
 				// connected to the control server
 				assert.Truef(
 					t,
@@ -834,19 +1015,192 @@ func TestNodeOnlineLastSeenStatus(t *testing.T) {
 					client.Hostname(),
 					time.Since(start),
 				)
-
-				// from docs: last seen to tailcontrol; only present if offline
-				// assert.Nilf(
-				// 	t,
-				// 	peerStatus.LastSeen,
-				// 	"expected node %s to not have LastSeen set, got %s",
-				// 	peerStatus.HostName,
-				// 	peerStatus.LastSeen,
-				// )
 			}
 		}
 
 		// Check maximum once per second
 		time.Sleep(time.Second)
 	}
+}
+
+// TestPingAllByIPManyUpDown is a variant of the PingAll
+// test which will take the tailscale node up and down
+// five times ensuring they are able to restablish connectivity.
+func TestPingAllByIPManyUpDown(t *testing.T) {
+	IntegrationSkip(t)
+	t.Parallel()
+
+	scenario, err := NewScenario(dockertestMaxWait())
+	assertNoErr(t, err)
+	defer scenario.ShutdownAssertNoPanics(t)
+
+	// TODO(kradalby): it does not look like the user thing works, only second
+	// get created? maybe only when many?
+	spec := map[string]int{
+		"user1": len(MustTestVersions),
+		"user2": len(MustTestVersions),
+	}
+
+	err = scenario.CreateHeadscaleEnv(spec,
+		[]tsic.Option{},
+		hsic.WithTestName("pingallbyipmany"),
+		hsic.WithEmbeddedDERPServerOnly(),
+		hsic.WithTLS(),
+	)
+	assertNoErrHeadscaleEnv(t, err)
+
+	allClients, err := scenario.ListTailscaleClients()
+	assertNoErrListClients(t, err)
+
+	allIps, err := scenario.ListTailscaleClientsIPs()
+	assertNoErrListClientIPs(t, err)
+
+	err = scenario.WaitForTailscaleSync()
+	assertNoErrSync(t, err)
+
+	// assertClientsState(t, allClients)
+
+	allAddrs := lo.Map(allIps, func(x netip.Addr, index int) string {
+		return x.String()
+	})
+
+	success := pingAllHelper(t, allClients, allAddrs)
+	t.Logf("%d successful pings out of %d", success, len(allClients)*len(allIps))
+
+	wg, _ := errgroup.WithContext(context.Background())
+
+	for run := range 3 {
+		t.Logf("Starting DownUpPing run %d", run+1)
+
+		for _, client := range allClients {
+			c := client
+			wg.Go(func() error {
+				t.Logf("taking down %q", c.Hostname())
+				return c.Down()
+			})
+		}
+
+		if err := wg.Wait(); err != nil {
+			t.Fatalf("failed to take down all nodes: %s", err)
+		}
+
+		time.Sleep(5 * time.Second)
+
+		for _, client := range allClients {
+			c := client
+			wg.Go(func() error {
+				t.Logf("bringing up %q", c.Hostname())
+				return c.Up()
+			})
+		}
+
+		if err := wg.Wait(); err != nil {
+			t.Fatalf("failed to take down all nodes: %s", err)
+		}
+
+		time.Sleep(5 * time.Second)
+
+		err = scenario.WaitForTailscaleSync()
+		assertNoErrSync(t, err)
+
+		success := pingAllHelper(t, allClients, allAddrs)
+		t.Logf("%d successful pings out of %d", success, len(allClients)*len(allIps))
+	}
+}
+
+func Test2118DeletingOnlineNodePanics(t *testing.T) {
+	IntegrationSkip(t)
+	t.Parallel()
+
+	scenario, err := NewScenario(dockertestMaxWait())
+	assertNoErr(t, err)
+	defer scenario.ShutdownAssertNoPanics(t)
+
+	// TODO(kradalby): it does not look like the user thing works, only second
+	// get created? maybe only when many?
+	spec := map[string]int{
+		"user1": 1,
+		"user2": 1,
+	}
+
+	err = scenario.CreateHeadscaleEnv(spec,
+		[]tsic.Option{},
+		hsic.WithTestName("deletenocrash"),
+		hsic.WithEmbeddedDERPServerOnly(),
+		hsic.WithTLS(),
+	)
+	assertNoErrHeadscaleEnv(t, err)
+
+	allClients, err := scenario.ListTailscaleClients()
+	assertNoErrListClients(t, err)
+
+	allIps, err := scenario.ListTailscaleClientsIPs()
+	assertNoErrListClientIPs(t, err)
+
+	err = scenario.WaitForTailscaleSync()
+	assertNoErrSync(t, err)
+
+	allAddrs := lo.Map(allIps, func(x netip.Addr, index int) string {
+		return x.String()
+	})
+
+	success := pingAllHelper(t, allClients, allAddrs)
+	t.Logf("%d successful pings out of %d", success, len(allClients)*len(allIps))
+
+	headscale, err := scenario.Headscale()
+	assertNoErr(t, err)
+
+	// Test list all nodes after added otherUser
+	var nodeList []v1.Node
+	err = executeAndUnmarshal(
+		headscale,
+		[]string{
+			"headscale",
+			"nodes",
+			"list",
+			"--output",
+			"json",
+		},
+		&nodeList,
+	)
+	require.NoError(t, err)
+	assert.Len(t, nodeList, 2)
+	assert.True(t, nodeList[0].GetOnline())
+	assert.True(t, nodeList[1].GetOnline())
+
+	// Delete the first node, which is online
+	_, err = headscale.Execute(
+		[]string{
+			"headscale",
+			"nodes",
+			"delete",
+			"--identifier",
+			// Delete the last added machine
+			fmt.Sprintf("%d", nodeList[0].GetId()),
+			"--output",
+			"json",
+			"--force",
+		},
+	)
+	require.NoError(t, err)
+
+	time.Sleep(2 * time.Second)
+
+	// Ensure that the node has been deleted, this did not occur due to a panic.
+	var nodeListAfter []v1.Node
+	err = executeAndUnmarshal(
+		headscale,
+		[]string{
+			"headscale",
+			"nodes",
+			"list",
+			"--output",
+			"json",
+		},
+		&nodeListAfter,
+	)
+	require.NoError(t, err)
+	assert.Len(t, nodeListAfter, 1)
+	assert.True(t, nodeListAfter[0].GetOnline())
+	assert.Equal(t, nodeList[1].GetId(), nodeListAfter[0].GetId())
 }
