@@ -3,12 +3,10 @@ package mapper
 import (
 	"fmt"
 	"net/netip"
-	"strconv"
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/policy"
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/samber/lo"
 	"tailscale.com/tailcfg"
 )
@@ -16,10 +14,8 @@ import (
 func tailNodes(
 	nodes types.Nodes,
 	capVer tailcfg.CapabilityVersion,
-	pol *policy.ACLPolicy,
-	dnsConfig *tailcfg.DNSConfig,
-	baseDomain string,
-	randomClientPort bool,
+	polMan policy.PolicyManager,
+	cfg *types.Config,
 ) ([]*tailcfg.Node, error) {
 	tNodes := make([]*tailcfg.Node, len(nodes))
 
@@ -27,10 +23,8 @@ func tailNodes(
 		node, err := tailNode(
 			node,
 			capVer,
-			pol,
-			dnsConfig,
-			baseDomain,
-			randomClientPort,
+			polMan,
+			cfg,
 		)
 		if err != nil {
 			return nil, err
@@ -42,17 +36,14 @@ func tailNodes(
 	return tNodes, nil
 }
 
-// tailNode converts a Node into a Tailscale Node. includeRoutes is false for shared nodes
-// as per the expected behaviour in the official SaaS.
+// tailNode converts a Node into a Tailscale Node.
 func tailNode(
 	node *types.Node,
 	capVer tailcfg.CapabilityVersion,
-	pol *policy.ACLPolicy,
-	dnsConfig *tailcfg.DNSConfig,
-	baseDomain string,
-	randomClientPort bool,
+	polMan policy.PolicyManager,
+	cfg *types.Config,
 ) (*tailcfg.Node, error) {
-	addrs := node.IPAddresses.Prefixes()
+	addrs := node.Prefixes()
 
 	allowedIPs := append(
 		[]netip.Prefix{},
@@ -71,11 +62,16 @@ func tailNode(
 		}
 	}
 
-	var derp string
+	var derp int
+
+	// TODO(kradalby): legacyDERP was removed in tailscale/tailscale@2fc4455e6dd9ab7f879d4e2f7cffc2be81f14077
+	// and should be removed after 111 is the minimum capver.
+	var legacyDERP string
 	if node.Hostinfo != nil && node.Hostinfo.NetInfo != nil {
-		derp = fmt.Sprintf("127.3.3.40:%d", node.Hostinfo.NetInfo.PreferredDERP)
+		legacyDERP = fmt.Sprintf("127.3.3.40:%d", node.Hostinfo.NetInfo.PreferredDERP)
+		derp = node.Hostinfo.NetInfo.PreferredDERP
 	} else {
-		derp = "127.3.3.40:0" // Zero means disconnected or unknown.
+		legacyDERP = "127.3.3.40:0" // Zero means disconnected or unknown.
 	}
 
 	var keyExpiry time.Time
@@ -85,35 +81,34 @@ func tailNode(
 		keyExpiry = time.Time{}
 	}
 
-	hostname, err := node.GetFQDN(dnsConfig, baseDomain)
+	hostname, err := node.GetFQDN(cfg.BaseDomain)
 	if err != nil {
 		return nil, fmt.Errorf("tailNode, failed to create FQDN: %s", err)
 	}
 
-	tags, _ := pol.TagsOfNode(node)
+	tags := polMan.Tags(node)
 	tags = lo.Uniq(append(tags, node.ForcedTags...))
 
 	tNode := tailcfg.Node{
-		ID: tailcfg.NodeID(node.ID), // this is the actual ID
-		StableID: tailcfg.StableNodeID(
-			strconv.FormatUint(node.ID, util.Base10),
-		), // in headscale, unlike tailcontrol server, IDs are permanent
-		Name: hostname,
-		Cap:  capVer,
+		ID:       tailcfg.NodeID(node.ID), // this is the actual ID
+		StableID: node.ID.StableID(),
+		Name:     hostname,
+		Cap:      capVer,
 
 		User: tailcfg.UserID(node.UserID),
 
 		Key:       node.NodeKey,
-		KeyExpiry: keyExpiry,
+		KeyExpiry: keyExpiry.UTC(),
 
-		Machine:    node.MachineKey,
-		DiscoKey:   node.DiscoKey,
-		Addresses:  addrs,
-		AllowedIPs: allowedIPs,
-		Endpoints:  node.Endpoints,
-		DERP:       derp,
-		Hostinfo:   node.Hostinfo.View(),
-		Created:    node.CreatedAt,
+		Machine:          node.MachineKey,
+		DiscoKey:         node.DiscoKey,
+		Addresses:        addrs,
+		AllowedIPs:       allowedIPs,
+		Endpoints:        node.Endpoints,
+		HomeDERP:         derp,
+		LegacyDERPString: legacyDERP,
+		Hostinfo:         node.Hostinfo.View(),
+		Created:          node.CreatedAt.UTC(),
 
 		Online: node.IsOnline,
 
@@ -125,32 +120,14 @@ func tailNode(
 		Expired:           node.IsExpired(),
 	}
 
-	//   - 74: 2023-09-18: Client understands NodeCapMap
-	if capVer >= 74 {
-		tNode.CapMap = tailcfg.NodeCapMap{
-			tailcfg.CapabilityFileSharing: []tailcfg.RawMessage{},
-			tailcfg.CapabilityAdmin:       []tailcfg.RawMessage{},
-			tailcfg.CapabilitySSH:         []tailcfg.RawMessage{},
-		}
-
-		if randomClientPort {
-			tNode.CapMap[tailcfg.NodeAttrRandomizeClientPort] = []tailcfg.RawMessage{}
-		}
-	} else {
-		tNode.Capabilities = []tailcfg.NodeCapability{
-			tailcfg.CapabilityFileSharing,
-			tailcfg.CapabilityAdmin,
-			tailcfg.CapabilitySSH,
-		}
-
-		if randomClientPort {
-			tNode.Capabilities = append(tNode.Capabilities, tailcfg.NodeAttrRandomizeClientPort)
-		}
+	tNode.CapMap = tailcfg.NodeCapMap{
+		tailcfg.CapabilityFileSharing: []tailcfg.RawMessage{},
+		tailcfg.CapabilityAdmin:       []tailcfg.RawMessage{},
+		tailcfg.CapabilitySSH:         []tailcfg.RawMessage{},
 	}
 
-	//   - 72: 2023-08-23: TS-2023-006 UPnP issue fixed; UPnP can now be used again
-	if capVer < 72 {
-		tNode.Capabilities = append(tNode.Capabilities, tailcfg.NodeAttrDisableUPnP)
+	if cfg.RandomizeClientPort {
+		tNode.CapMap[tailcfg.NodeAttrRandomizeClientPort] = []tailcfg.RawMessage{}
 	}
 
 	if node.IsOnline == nil || !*node.IsOnline {

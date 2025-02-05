@@ -1,7 +1,6 @@
 package hscontrol
 
 import (
-	"net/netip"
 	"os"
 	"testing"
 
@@ -47,12 +46,7 @@ func (s *Suite) ResetDB(c *check.C) {
 				Path: tmpDir + "/headscale_test.db",
 			},
 		},
-		IPPrefixes: []netip.Prefix{
-			netip.MustParsePrefix("10.27.0.0/23"),
-		},
-		OIDC: types.OIDCConfig{
-			StripEmaildomain: false,
-		},
+		OIDC: types.OIDCConfig{},
 	}
 
 	app, err = NewHeadscale(&cfg)

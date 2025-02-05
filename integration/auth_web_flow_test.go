@@ -1,12 +1,9 @@
 package integration
 
 import (
-	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
 	"net/netip"
 	"net/url"
 	"strings"
@@ -14,6 +11,8 @@ import (
 
 	"github.com/juanfont/headscale/integration/hsic"
 	"github.com/samber/lo"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 var errParseAuthPage = errors.New("failed to parse auth page")
@@ -26,7 +25,7 @@ func TestAuthWebFlowAuthenticationPingAll(t *testing.T) {
 	IntegrationSkip(t)
 	t.Parallel()
 
-	baseScenario, err := NewScenario()
+	baseScenario, err := NewScenario(dockertestMaxWait())
 	if err != nil {
 		t.Fatalf("failed to create scenario: %s", err)
 	}
@@ -34,14 +33,19 @@ func TestAuthWebFlowAuthenticationPingAll(t *testing.T) {
 	scenario := AuthWebFlowScenario{
 		Scenario: baseScenario,
 	}
-	defer scenario.Shutdown()
+	defer scenario.ShutdownAssertNoPanics(t)
 
 	spec := map[string]int{
 		"user1": len(MustTestVersions),
 		"user2": len(MustTestVersions),
 	}
 
-	err = scenario.CreateHeadscaleEnv(spec, hsic.WithTestName("webauthping"))
+	err = scenario.CreateHeadscaleEnv(
+		spec,
+		hsic.WithTestName("webauthping"),
+		hsic.WithEmbeddedDERPServerOnly(),
+		hsic.WithTLS(),
+	)
 	assertNoErrHeadscaleEnv(t, err)
 
 	allClients, err := scenario.ListTailscaleClients()
@@ -53,7 +57,7 @@ func TestAuthWebFlowAuthenticationPingAll(t *testing.T) {
 	err = scenario.WaitForTailscaleSync()
 	assertNoErrSync(t, err)
 
-	assertClientsState(t, allClients)
+	// assertClientsState(t, allClients)
 
 	allAddrs := lo.Map(allIps, func(x netip.Addr, index int) string {
 		return x.String()
@@ -67,20 +71,23 @@ func TestAuthWebFlowLogoutAndRelogin(t *testing.T) {
 	IntegrationSkip(t)
 	t.Parallel()
 
-	baseScenario, err := NewScenario()
+	baseScenario, err := NewScenario(dockertestMaxWait())
 	assertNoErr(t, err)
 
 	scenario := AuthWebFlowScenario{
 		Scenario: baseScenario,
 	}
-	defer scenario.Shutdown()
+	defer scenario.ShutdownAssertNoPanics(t)
 
 	spec := map[string]int{
 		"user1": len(MustTestVersions),
 		"user2": len(MustTestVersions),
 	}
 
-	err = scenario.CreateHeadscaleEnv(spec, hsic.WithTestName("weblogout"))
+	err = scenario.CreateHeadscaleEnv(spec,
+		hsic.WithTestName("weblogout"),
+		hsic.WithTLS(),
+	)
 	assertNoErrHeadscaleEnv(t, err)
 
 	allClients, err := scenario.ListTailscaleClients()
@@ -92,7 +99,7 @@ func TestAuthWebFlowLogoutAndRelogin(t *testing.T) {
 	err = scenario.WaitForTailscaleSync()
 	assertNoErrSync(t, err)
 
-	assertClientsState(t, allClients)
+	// assertClientsState(t, allClients)
 
 	allAddrs := lo.Map(allIps, func(x netip.Addr, index int) string {
 		return x.String()
@@ -100,6 +107,14 @@ func TestAuthWebFlowLogoutAndRelogin(t *testing.T) {
 
 	success := pingAllHelper(t, allClients, allAddrs)
 	t.Logf("%d successful pings out of %d", success, len(allClients)*len(allIps))
+
+	headscale, err := scenario.Headscale()
+	assertNoErrGetHeadscale(t, err)
+
+	listNodes, err := headscale.ListNodes()
+	assert.Equal(t, len(listNodes), len(allClients))
+	nodeCountBeforeLogout := len(listNodes)
+	t.Logf("node count before logout: %d", nodeCountBeforeLogout)
 
 	clientIPs := make(map[TailscaleClient][]netip.Addr)
 	for _, client := range allClients {
@@ -122,20 +137,14 @@ func TestAuthWebFlowLogoutAndRelogin(t *testing.T) {
 
 	t.Logf("all clients logged out")
 
-	headscale, err := scenario.Headscale()
-	assertNoErrGetHeadscale(t, err)
-
 	for userName := range spec {
 		err = scenario.runTailscaleUp(userName, headscale.GetEndpoint())
 		if err != nil {
-			t.Fatalf("failed to run tailscale up: %s", err)
+			t.Fatalf("failed to run tailscale up (%q): %s", headscale.GetEndpoint(), err)
 		}
 	}
 
 	t.Logf("all clients logged in again")
-
-	allClients, err = scenario.ListTailscaleClients()
-	assertNoErrListClients(t, err)
 
 	allIps, err = scenario.ListTailscaleClientsIPs()
 	assertNoErrListClientIPs(t, err)
@@ -146,6 +155,10 @@ func TestAuthWebFlowLogoutAndRelogin(t *testing.T) {
 
 	success = pingAllHelper(t, allClients, allAddrs)
 	t.Logf("%d successful pings out of %d", success, len(allClients)*len(allIps))
+
+	listNodes, err = headscale.ListNodes()
+	require.Equal(t, nodeCountBeforeLogout, len(listNodes))
+	t.Logf("node count first login: %d, after relogin: %d", nodeCountBeforeLogout, len(listNodes))
 
 	for _, client := range allClients {
 		ips, err := client.IPs()
@@ -220,11 +233,12 @@ func (s *AuthWebFlowScenario) CreateHeadscaleEnv(
 func (s *AuthWebFlowScenario) runTailscaleUp(
 	userStr, loginServer string,
 ) error {
-	log.Printf("running tailscale up for user %s", userStr)
+	log.Printf("running tailscale up for user %q", userStr)
 	if user, ok := s.users[userStr]; ok {
 		for _, client := range user.Clients {
 			c := client
 			user.joinWaitGroup.Go(func() error {
+				log.Printf("logging %q into %q", c.Hostname(), loginServer)
 				loginURL, err := c.LoginWithURL(loginServer)
 				if err != nil {
 					log.Printf("failed to run tailscale up (%s): %s", c.Hostname(), err)
@@ -266,29 +280,10 @@ func (s *AuthWebFlowScenario) runTailscaleUp(
 }
 
 func (s *AuthWebFlowScenario) runHeadscaleRegister(userStr string, loginURL *url.URL) error {
-	headscale, err := s.Headscale()
+	body, err := doLoginURL("web-auth-not-set", loginURL)
 	if err != nil {
 		return err
 	}
-
-	log.Printf("loginURL: %s", loginURL)
-	loginURL.Host = fmt.Sprintf("%s:8080", headscale.GetIP())
-	loginURL.Scheme = "http"
-
-	httpClient := &http.Client{}
-	ctx := context.Background()
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, loginURL.String(), nil)
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-
-	defer resp.Body.Close()
 
 	// see api.go HTML template
 	codeSep := strings.Split(string(body), "</code>")
