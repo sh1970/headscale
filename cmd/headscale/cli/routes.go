@@ -7,10 +7,10 @@ import (
 	"strconv"
 
 	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
-	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/pterm/pterm"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc/status"
+	"tailscale.com/net/tsaddr"
 )
 
 const (
@@ -25,21 +25,21 @@ func init() {
 	enableRouteCmd.Flags().Uint64P("route", "r", 0, "Route identifier (ID)")
 	err := enableRouteCmd.MarkFlagRequired("route")
 	if err != nil {
-		log.Fatalf(err.Error())
+		log.Fatal(err.Error())
 	}
 	routesCmd.AddCommand(enableRouteCmd)
 
 	disableRouteCmd.Flags().Uint64P("route", "r", 0, "Route identifier (ID)")
 	err = disableRouteCmd.MarkFlagRequired("route")
 	if err != nil {
-		log.Fatalf(err.Error())
+		log.Fatal(err.Error())
 	}
 	routesCmd.AddCommand(disableRouteCmd)
 
 	deleteRouteCmd.Flags().Uint64P("route", "r", 0, "Route identifier (ID)")
 	err = deleteRouteCmd.MarkFlagRequired("route")
 	if err != nil {
-		log.Fatalf(err.Error())
+		log.Fatal(err.Error())
 	}
 	routesCmd.AddCommand(deleteRouteCmd)
 }
@@ -64,11 +64,9 @@ var listRoutesCmd = &cobra.Command{
 				fmt.Sprintf("Error getting machine id from flag: %s", err),
 				output,
 			)
-
-			return
 		}
 
-		ctx, client, conn, cancel := getHeadscaleCLIClient()
+		ctx, client, conn, cancel := newHeadscaleCLIWithConfig()
 		defer cancel()
 		defer conn.Close()
 
@@ -82,14 +80,10 @@ var listRoutesCmd = &cobra.Command{
 					fmt.Sprintf("Cannot get nodes: %s", status.Convert(err).Message()),
 					output,
 				)
-
-				return
 			}
 
 			if output != "" {
 				SuccessOutput(response.GetRoutes(), "", output)
-
-				return
 			}
 
 			routes = response.GetRoutes()
@@ -103,14 +97,10 @@ var listRoutesCmd = &cobra.Command{
 					fmt.Sprintf("Cannot get routes for node %d: %s", machineID, status.Convert(err).Message()),
 					output,
 				)
-
-				return
 			}
 
 			if output != "" {
 				SuccessOutput(response.GetRoutes(), "", output)
-
-				return
 			}
 
 			routes = response.GetRoutes()
@@ -119,8 +109,6 @@ var listRoutesCmd = &cobra.Command{
 		tableData := routesToPtables(routes)
 		if err != nil {
 			ErrorOutput(err, fmt.Sprintf("Error converting to table: %s", err), output)
-
-			return
 		}
 
 		err = pterm.DefaultTable.WithHasHeader().WithData(tableData).Render()
@@ -130,8 +118,6 @@ var listRoutesCmd = &cobra.Command{
 				fmt.Sprintf("Failed to render pterm table: %s", err),
 				output,
 			)
-
-			return
 		}
 	},
 }
@@ -150,11 +136,9 @@ var enableRouteCmd = &cobra.Command{
 				fmt.Sprintf("Error getting machine id from flag: %s", err),
 				output,
 			)
-
-			return
 		}
 
-		ctx, client, conn, cancel := getHeadscaleCLIClient()
+		ctx, client, conn, cancel := newHeadscaleCLIWithConfig()
 		defer cancel()
 		defer conn.Close()
 
@@ -167,14 +151,10 @@ var enableRouteCmd = &cobra.Command{
 				fmt.Sprintf("Cannot enable route %d: %s", routeID, status.Convert(err).Message()),
 				output,
 			)
-
-			return
 		}
 
 		if output != "" {
 			SuccessOutput(response, "", output)
-
-			return
 		}
 	},
 }
@@ -193,11 +173,9 @@ var disableRouteCmd = &cobra.Command{
 				fmt.Sprintf("Error getting machine id from flag: %s", err),
 				output,
 			)
-
-			return
 		}
 
-		ctx, client, conn, cancel := getHeadscaleCLIClient()
+		ctx, client, conn, cancel := newHeadscaleCLIWithConfig()
 		defer cancel()
 		defer conn.Close()
 
@@ -210,14 +188,10 @@ var disableRouteCmd = &cobra.Command{
 				fmt.Sprintf("Cannot disable route %d: %s", routeID, status.Convert(err).Message()),
 				output,
 			)
-
-			return
 		}
 
 		if output != "" {
 			SuccessOutput(response, "", output)
-
-			return
 		}
 	},
 }
@@ -236,11 +210,9 @@ var deleteRouteCmd = &cobra.Command{
 				fmt.Sprintf("Error getting machine id from flag: %s", err),
 				output,
 			)
-
-			return
 		}
 
-		ctx, client, conn, cancel := getHeadscaleCLIClient()
+		ctx, client, conn, cancel := newHeadscaleCLIWithConfig()
 		defer cancel()
 		defer conn.Close()
 
@@ -253,14 +225,10 @@ var deleteRouteCmd = &cobra.Command{
 				fmt.Sprintf("Cannot delete route %d: %s", routeID, status.Convert(err).Message()),
 				output,
 			)
-
-			return
 		}
 
 		if output != "" {
 			SuccessOutput(response, "", output)
-
-			return
 		}
 	},
 }
@@ -277,16 +245,21 @@ func routesToPtables(routes []*v1.Route) pterm.TableData {
 
 			continue
 		}
-		if prefix == types.ExitRouteV4 || prefix == types.ExitRouteV6 {
+		if tsaddr.IsExitRoute(prefix) {
 			isPrimaryStr = "-"
 		} else {
 			isPrimaryStr = strconv.FormatBool(route.GetIsPrimary())
 		}
 
+		var nodeName string
+		if route.GetNode() != nil {
+			nodeName = route.GetNode().GetGivenName()
+		}
+
 		tableData = append(tableData,
 			[]string{
 				strconv.FormatUint(route.GetId(), Base10),
-				route.GetNode().GetGivenName(),
+				nodeName,
 				route.GetPrefix(),
 				strconv.FormatBool(route.GetAdvertised()),
 				strconv.FormatBool(route.GetEnabled()),

@@ -10,6 +10,7 @@ import (
 
 	"github.com/juanfont/headscale/hscontrol/types"
 	"gorm.io/gorm"
+	"tailscale.com/util/set"
 )
 
 var (
@@ -21,31 +22,36 @@ var (
 )
 
 func (hsdb *HSDatabase) CreatePreAuthKey(
-	userName string,
+	uid types.UserID,
 	reusable bool,
 	ephemeral bool,
 	expiration *time.Time,
 	aclTags []string,
 ) (*types.PreAuthKey, error) {
 	return Write(hsdb.DB, func(tx *gorm.DB) (*types.PreAuthKey, error) {
-		return CreatePreAuthKey(tx, userName, reusable, ephemeral, expiration, aclTags)
+		return CreatePreAuthKey(tx, uid, reusable, ephemeral, expiration, aclTags)
 	})
 }
 
 // CreatePreAuthKey creates a new PreAuthKey in a user, and returns it.
 func CreatePreAuthKey(
 	tx *gorm.DB,
-	userName string,
+	uid types.UserID,
 	reusable bool,
 	ephemeral bool,
 	expiration *time.Time,
 	aclTags []string,
 ) (*types.PreAuthKey, error) {
-	user, err := GetUser(tx, userName)
+	user, err := GetUserByID(tx, uid)
 	if err != nil {
 		return nil, err
 	}
 
+	// Remove duplicates
+	aclTags = set.SetOf(aclTags).Slice()
+
+	// TODO(kradalby): factor out and create a reusable tag validation,
+	// check if there is one in Tailscale's lib.
 	for _, tag := range aclTags {
 		if !strings.HasPrefix(tag, "tag:") {
 			return nil, fmt.Errorf(
@@ -57,6 +63,7 @@ func CreatePreAuthKey(
 	}
 
 	now := time.Now().UTC()
+	// TODO(kradalby): unify the key generations spread all over the code.
 	kstr, err := generateKey()
 	if err != nil {
 		return nil, err
@@ -70,78 +77,58 @@ func CreatePreAuthKey(
 		Ephemeral:  ephemeral,
 		CreatedAt:  &now,
 		Expiration: expiration,
+		Tags:       aclTags,
 	}
 
 	if err := tx.Save(&key).Error; err != nil {
 		return nil, fmt.Errorf("failed to create key in the database: %w", err)
 	}
 
-	if len(aclTags) > 0 {
-		seenTags := map[string]bool{}
-
-		for _, tag := range aclTags {
-			if !seenTags[tag] {
-				if err := tx.Save(&types.PreAuthKeyACLTag{PreAuthKeyID: key.ID, Tag: tag}).Error; err != nil {
-					return nil, fmt.Errorf(
-						"failed to ceate key tag in the database: %w",
-						err,
-					)
-				}
-				seenTags[tag] = true
-			}
-		}
-	}
-
-	if err != nil {
-		return nil, err
-	}
-
 	return &key, nil
 }
 
-func (hsdb *HSDatabase) ListPreAuthKeys(userName string) ([]types.PreAuthKey, error) {
+func (hsdb *HSDatabase) ListPreAuthKeys(uid types.UserID) ([]types.PreAuthKey, error) {
 	return Read(hsdb.DB, func(rx *gorm.DB) ([]types.PreAuthKey, error) {
-		return ListPreAuthKeys(rx, userName)
+		return ListPreAuthKeysByUser(rx, uid)
 	})
 }
 
-// ListPreAuthKeys returns the list of PreAuthKeys for a user.
-func ListPreAuthKeys(tx *gorm.DB, userName string) ([]types.PreAuthKey, error) {
-	user, err := GetUser(tx, userName)
+// ListPreAuthKeysByUser returns the list of PreAuthKeys for a user.
+func ListPreAuthKeysByUser(tx *gorm.DB, uid types.UserID) ([]types.PreAuthKey, error) {
+	user, err := GetUserByID(tx, uid)
 	if err != nil {
 		return nil, err
 	}
 
 	keys := []types.PreAuthKey{}
-	if err := tx.Preload("User").Preload("ACLTags").Where(&types.PreAuthKey{UserID: user.ID}).Find(&keys).Error; err != nil {
+	if err := tx.Preload("User").Where(&types.PreAuthKey{UserID: user.ID}).Find(&keys).Error; err != nil {
 		return nil, err
 	}
 
 	return keys, nil
 }
 
-// GetPreAuthKey returns a PreAuthKey for a given key.
-func GetPreAuthKey(tx *gorm.DB, user string, key string) (*types.PreAuthKey, error) {
-	pak, err := ValidatePreAuthKey(tx, key)
-	if err != nil {
-		return nil, err
+func (hsdb *HSDatabase) GetPreAuthKey(key string) (*types.PreAuthKey, error) {
+	return Read(hsdb.DB, func(rx *gorm.DB) (*types.PreAuthKey, error) {
+		return GetPreAuthKey(rx, key)
+	})
+}
+
+// GetPreAuthKey returns a PreAuthKey for a given key. The caller is responsible
+// for checking if the key is usable (expired or used).
+func GetPreAuthKey(tx *gorm.DB, key string) (*types.PreAuthKey, error) {
+	pak := types.PreAuthKey{}
+	if err := tx.Preload("User").First(&pak, "key = ?", key).Error; err != nil {
+		return nil, ErrPreAuthKeyNotFound
 	}
 
-	if pak.User.Name != user {
-		return nil, ErrUserMismatch
-	}
-
-	return pak, nil
+	return &pak, nil
 }
 
 // DestroyPreAuthKey destroys a preauthkey. Returns error if the PreAuthKey
 // does not exist.
 func DestroyPreAuthKey(tx *gorm.DB, pak types.PreAuthKey) error {
 	return tx.Transaction(func(db *gorm.DB) error {
-		if result := db.Unscoped().Where(types.PreAuthKeyACLTag{PreAuthKeyID: pak.ID}).Delete(&types.PreAuthKeyACLTag{}); result.Error != nil {
-			return result.Error
-		}
-
 		if result := db.Unscoped().Delete(pak); result.Error != nil {
 			return result.Error
 		}
@@ -156,15 +143,6 @@ func (hsdb *HSDatabase) ExpirePreAuthKey(k *types.PreAuthKey) error {
 	})
 }
 
-// MarkExpirePreAuthKey marks a PreAuthKey as expired.
-func ExpirePreAuthKey(tx *gorm.DB, k *types.PreAuthKey) error {
-	if err := tx.Model(&k).Update("Expiration", time.Now()).Error; err != nil {
-		return err
-	}
-
-	return nil
-}
-
 // UsePreAuthKey marks a PreAuthKey as used.
 func UsePreAuthKey(tx *gorm.DB, k *types.PreAuthKey) error {
 	k.Used = true
@@ -175,44 +153,13 @@ func UsePreAuthKey(tx *gorm.DB, k *types.PreAuthKey) error {
 	return nil
 }
 
-func (hsdb *HSDatabase) ValidatePreAuthKey(k string) (*types.PreAuthKey, error) {
-	return Read(hsdb.DB, func(rx *gorm.DB) (*types.PreAuthKey, error) {
-		return ValidatePreAuthKey(rx, k)
-	})
-}
-
-// ValidatePreAuthKey does the heavy lifting for validation of the PreAuthKey coming from a node
-// If returns no error and a PreAuthKey, it can be used.
-func ValidatePreAuthKey(tx *gorm.DB, k string) (*types.PreAuthKey, error) {
-	pak := types.PreAuthKey{}
-	if result := tx.Preload("User").Preload("ACLTags").First(&pak, "key = ?", k); errors.Is(
-		result.Error,
-		gorm.ErrRecordNotFound,
-	) {
-		return nil, ErrPreAuthKeyNotFound
+// MarkExpirePreAuthKey marks a PreAuthKey as expired.
+func ExpirePreAuthKey(tx *gorm.DB, k *types.PreAuthKey) error {
+	if err := tx.Model(&k).Update("Expiration", time.Now()).Error; err != nil {
+		return err
 	}
 
-	if pak.Expiration != nil && pak.Expiration.Before(time.Now()) {
-		return nil, ErrPreAuthKeyExpired
-	}
-
-	if pak.Reusable || pak.Ephemeral { // we don't need to check if has been used before
-		return &pak, nil
-	}
-
-	nodes := types.Nodes{}
-	if err := tx.
-		Preload("AuthKey").
-		Where(&types.Node{AuthKeyID: uint(pak.ID)}).
-		Find(&nodes).Error; err != nil {
-		return nil, err
-	}
-
-	if len(nodes) != 0 || pak.Used {
-		return nil, ErrSingleUseAuthKeyHasBeenUsed
-	}
-
-	return &pak, nil
+	return nil
 }
 
 func generateKey() (string, error) {
